@@ -1,34 +1,35 @@
 #pragma once
 
 #include <iostream>
+#include "Common.h"
 using std::cout;
 using std::endl;
 
-#ifdef _WIN32
-#include<windows.h>
-#else 
-//linux ...
-#endif
+//#ifdef _WIN32
+//#include<windows.h>
+//#else 
+////linux ...
+//#endif
 
-// 直接去堆上按页申请空间
-inline static void* SystemAlloc(size_t kpage)
-{
-#ifdef _WIN32
-	void* ptr = VirtualAlloc(0, kpage << 13, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-	// linux下brk mmap等
-#endif
-
-	if (ptr == nullptr)
-		throw std::bad_alloc();
-
-	return ptr;
-}
-
-void*& NextObj(void* obj)
-{
-	return *((void**)obj);//得到这个内存块的头4/8个字节，等同于next指针，用来存储下一个结点的地址
-}
+//// 直接去堆上按页申请空间
+//inline static void* SystemAlloc(size_t kpage)
+//{
+//#ifdef _WIN32
+//	void* ptr = VirtualAlloc(0, kpage << 13, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+//#else
+//	// linux下brk mmap等
+//#endif
+//
+//	if (ptr == nullptr)
+//		throw std::bad_alloc();
+//
+//	return ptr;
+//}
+//
+//void*& NextObj(void* obj)
+//{
+//	return *((void**)obj);//得到这个内存块的头4/8个字节，等同于next指针，用来存储下一个结点的地址
+//}
 
 //对象内存池（定长去切，特定情况下效率比malloc略高）
 template<class T>//每次创建一个T对象

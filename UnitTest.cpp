@@ -2,10 +2,12 @@
 
 
 #include "ObjectPool.h"
-
+#include "ConcurrentAlloc.h"
 int main()
 {
-	TestObjectPool();
-
+	//TestObjectPool();
+	ConcurrentAlloc(50);
+	ConcurrentAlloc(50);
+	ConcurrentAlloc(50);
 	return 0;
 }
