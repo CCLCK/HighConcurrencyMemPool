@@ -16,7 +16,8 @@ public:
 	//参数index就是size对应的桶号，传入是因为线程缓存和中心缓存映射规则相同
 	void* FetchFromCentralCache(size_t index, size_t size);
 
-
+	//释放对象链表过长时，回收内存到中心缓存
+	void ListTooLong(FreeList& list, size_t size);
 
 private:
 	FreeList _freeList[NFREELIST];

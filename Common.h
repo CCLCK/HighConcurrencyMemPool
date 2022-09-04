@@ -2,16 +2,62 @@
 
 #include <iostream>
 #include <assert.h>
+#include <thread>
+#include<mutex>
+#include <unordered_map>
 using std::cout;
 using std::endl;
 
 static const size_t NFREELIST = 208;//256KB按我们的映射一共有208个桶
-static const size_t MAXBYTES = 256 * 1024;
+static const size_t MAX_BYTES = 256 * 1024;
+static const size_t NPAGES = 129;//pagecache里最大管理多少页的span
+static const size_t PAGE_SHIFT = 13;
 
+
+
+//PAHE_SHIFT便于计算一次要的页数
 
 //条件编译保证能够存储页号不溢出
 //64位下会定义_WIN64和_WIN32两个宏，32位只会定义_WIN32
+#ifdef _WIN64
+typedef unsigned long long PAGEID;
+#elif _WIN32
+typedef size_t PAGEID;
+#else
+typedef unsigned long long PAGEID;
+#endif // _WIN64
 
+
+#ifdef _WIN32
+#include<windows.h>
+#else 
+//linux ...
+#endif
+
+// 直接去堆上按页申请空间
+inline static void* SystemAlloc(size_t kpage)
+{
+#ifdef _WIN32
+	void* ptr = VirtualAlloc(0, kpage << 13, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+	// linux下brk mmap等
+#endif
+
+	if (ptr == nullptr)
+		throw std::bad_alloc();
+
+	return ptr;
+}
+
+// 直接把这块空间还给堆
+inline static void SystemFree(void* ptr)
+{
+#ifdef _WIN32
+	VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+	// sbrk unmmap等
+#endif
+}
 
 
 
@@ -33,6 +79,13 @@ public:
 		assert(obj);
 		NextObj(obj) = _freeList;
 		_freeList = obj;
+		_size++;
+	}
+	void PushRange(void* start, void* end,size_t n)//end指向最后一个有效的内存块，而不是nullptr
+	{
+		NextObj(end) = _freeList;
+		_freeList = start;
+		_size += n;
 	}
 	void* Pop()
 	{
@@ -43,15 +96,35 @@ public:
 		assert(_freeList);
 		void* obj = _freeList;
 		_freeList = NextObj(_freeList);
+		_size--;
 		return obj;//头删结点的指针
 	}
 	bool Empty()
 	{
 		return _freeList == nullptr;
 	}
+	size_t Size()
+	{
+		return _size;
+	}
+	void PopRange(void*& start, void*& end, size_t n)
+	{
+		assert(n <= _size);
+		start = _freeList;
+		end = _freeList;
+		for (size_t i=0;i<n;i++)
+		{
+			end = NextObj(end);
+		}
+		_freeList = end;
+		end = nullptr;
+		_size -= n;
+	}
+	size_t _MaxSize = 1;
+
 private:
 	void* _freeList=nullptr;
-	//maxSize
+	size_t _size = 0;
 };
 
 //计算对象大小的映射规则  
@@ -102,7 +175,10 @@ public:
 		else
 		{
 			//申请大于256KB的
-			assert(false);
+			//assert(false);
+
+			//以1<<PAGE_SHIFT对齐
+			return _RoundUp(size, 1 << PAGE_SHIFT);
 		}
 	}
 
@@ -145,13 +221,42 @@ public:
 		}
 		else {
 			assert(false);
+
+			
 		}
 
 		return -1;
 	}
 
 	//慢开始算法
+	static size_t NumMoveSize(size_t size)
+	{
+		assert(size > 0);
 
+		size_t num = MAX_BYTES / size;//MAX_BYTES就是256KB
+		if (num<2)
+		{
+			num = 2;
+		}
+		if (num>512)
+		{
+			num = 512;
+		}
+		return num;
+	}
+
+	//NumMovePage 一次要多少页
+	static size_t NumMovePage(size_t size)//size这么大小的对象一次给几页
+	{
+		size_t num = NumMoveSize(size);//要几个
+		size_t npage = num * size;//一共要这么多个字节
+		npage >>= PAGE_SHIFT;//要多少页
+		if (npage==0)
+		{
+			npage = 1;
+		}
+		return npage;
+	}
 private:
 };
 
@@ -162,19 +267,22 @@ struct Span
 {
 	//大块内存起始页的页号
 	//64位下以每页8KB为例一共有2^64/2^13=2^51页，int存不下，用unsigned long long+条件编译解决
-
-	//页的数量
-	
+	PAGEID _pageId = 0;
+	//页的数量,有几页大小
+	size_t _n = 0;
 	//双向链表的结构
-
+	Span* _next=nullptr;
+	Span* _prev = nullptr;
 
 	//切好的小块内存被分配给thread cache的计数
-
+	size_t _useCount = 0;
 	//切好的小块内存的自由链表
-	
+	void* _freeList = nullptr;
 	//当前span是否在被使用
+	bool _isUse = false;
 
-
+	//这个span切的小对象的大小
+	size_t _objSize = 0;
 };
 
 //带头双向循环链表，把Span串起来
@@ -185,31 +293,71 @@ public:
 	//双向循环链表初始化
 	SpanList()
 	{
-
+		_head = new Span;//不new _head会是空
+		_head->_next = _head;
+		_head->_prev = _head;
 	}
 
 	void Insert(Span* pos, Span* newSpan)
 	{
 		//在pos位置插入newSpan
-
 		//断言pos和newSpan
-
+		assert(pos && newSpan);
 		//开始插入
+		Span* prev = pos->_prev;
+		prev->_next = newSpan;
+		newSpan->_next = pos;
+		pos->_prev = newSpan;
+		newSpan->_prev = prev;
 	}
 
-	void Erase(Span* pos)
+	void Erase(Span* pos)//这里并不delete,delete就还给系统了
 	{
 		//删掉pos位置的span
-
 		//断言span和哨兵位的头结点
-
+		assert(pos&&pos!=_head);
 		//开始删除
+		Span* prev = pos->_prev;
+		Span* next = pos->_next;
+		prev->_next = next;
+		next->_prev = prev;
 	}
 
+	//提供一个begin和end的接口，注意双链表是带头的
+	Span* Begin()
+	{
+		return _head->_next;
+	}
+	Span* End()
+	{
+		return _head;
+	}
 
+	bool Empty()
+	{
+		return _head->_next == _head;
+	}
+	Span* PopFront()
+	{
+		//保证有元素再头删
+		
+		/*if (Empty())
+		{
+			int x = 0;
+		}*/
+		assert(!Empty());
+		Span* front = _head->_next;
+		Erase(front);
+		return front;
+	}
+	void PushFront(Span* span)
+	{
+		Insert(Begin(), span);
+	}
 private:
 	Span* _head;
 
 public:
 	//桶锁
+	std::mutex _mtx;
 };
